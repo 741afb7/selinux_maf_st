@@ -12,6 +12,7 @@
 #include <linux/printk.h>
 #include <linux/sched.h>
 #include <linux/fs.h>
+#include <linux/vmalloc.h>
 #include <linux/err.h>
 #include <asm/current.h>
 #include <asm-generic/rwonce.h>
@@ -70,8 +71,10 @@ struct policy_file {
 static int (*policydb_read_fn)(struct policydb *policydb, struct policy_file *fp);
 static void (*policydb_destroy_fn)(struct policydb *policydb);
 static void *(*vmalloc_fn)(unsigned long size);
-static void *(*vmalloc_to_page_fn)(const void *addr);
+static void *(*vmalloc_user_fn)(unsigned long size);
 static void (*vfree_fn)(const void *addr);
+static int (*sel_mmap_handle_status_fn)(struct file *, struct vm_area_struct *);
+static int (*remap_vmalloc_range_fn)(struct vm_area_struct *, void *, unsigned long);
 static struct file *(*filp_open_fn)(const char *filename, int flags, umode_t mode);
 static int (*filp_close_fn)(struct file *filp, fl_owner_t id);
 static ssize_t (*kernel_read_fn)(struct file *file, void *buf, size_t count, loff_t *pos);
@@ -106,8 +109,7 @@ struct clean_eval_scope {
 static struct access_probe g_probes[ACCESS_PROBE_SLOTS];
 static struct clean_eval_scope g_clean_eval_scopes[CLEAN_EVAL_SCOPE_SLOTS];
 static unsigned char g_clean_status_bytes[SELINUX_STATUS_SIZE];
-static void *g_fake_status_page;
-static bool g_status_page_redirect_hooked;
+static void *g_status_mmap_page;
 
 /* Spinlock guards for the scope arrays.  We do not use DEFINE_SPINLOCK +
  * spin_lock() because the running kernel on this device does not export
@@ -147,8 +149,8 @@ static bool current_in_clean_eval_scope(void);
 static int install_write_op_hooks(void);
 static void record_inline_hook(void *func, void *before, void *after);
 static void uninstall_inline_hooks(void);
-static void before_selinux_kernel_status_page(hook_fargs4_t *a, void *u);
-static bool install_status_page_redirect(void);
+static int sel_mmap_handle_status_hook(struct file *file, struct vm_area_struct *vma);
+static bool install_status_hooks(void);
 
 /*
  * Patch the seqno field (5th whitespace-separated token, formatted as "%u")
@@ -429,8 +431,11 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("probe_kernel_read"),
     SYMBOL_CACHE_ENTRY("vmalloc"),
     SYMBOL_CACHE_ENTRY("vmalloc_noprof"),
-    SYMBOL_CACHE_ENTRY("vmalloc_to_page"),
+    SYMBOL_CACHE_ENTRY("vmalloc_user"),
     SYMBOL_CACHE_ENTRY("vfree"),
+    SYMBOL_CACHE_ENTRY("sel_read_handle_status"),
+    SYMBOL_CACHE_ENTRY("sel_mmap_handle_status"),
+    SYMBOL_CACHE_ENTRY("remap_vmalloc_range"),
     SYMBOL_CACHE_ENTRY("filp_open"),
     SYMBOL_CACHE_ENTRY("filp_close"),
     SYMBOL_CACHE_ENTRY("kernel_read"),
@@ -446,7 +451,6 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("cond_compute_av"),
     SYMBOL_CACHE_ENTRY("constraint_expr_eval"),
     SYMBOL_CACHE_ENTRY("type_attribute_bounds_av"),
-    SYMBOL_CACHE_ENTRY("selinux_kernel_status_page"),
     SYMBOL_CACHE_ENTRY("selinux_setprocattr"),
     SYMBOL_CACHE_ENTRY("sel_write_access"),
     SYMBOL_CACHE_ENTRY("sel_write_context"),
@@ -1520,86 +1524,106 @@ static void after_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
         leave_clean_eval_scope();
 }
 
-/*
- * Return a clean backing page when an app opens /sys/fs/selinux/status.
- * sel_open_handle_status() stores selinux_kernel_status_page()'s return value
- * in filp->private_data, so redirecting the page factory covers both the read
- * and mmap paths without relying on any private structure offsets.
- */
-static void before_selinux_kernel_status_page(hook_fargs4_t *a, void *u)
+/* /sys/fs/selinux/status has independent read and mmap handlers. */
+static int sel_mmap_handle_status_hook(struct file *file, struct vm_area_struct *vma)
 {
-    void *page;
+    if (should_bypass_clean_filter(current_uid()) || !g_status_mmap_page ||
+        !remap_vmalloc_range_fn)
+        return sel_mmap_handle_status_fn(file, vma);
 
-    if (should_bypass_clean_filter(current_uid()))
-        return;
+    if (!remap_vmalloc_range_fn(vma, g_status_mmap_page, 0))
+        return 0;
 
-    if (!g_fake_status_page || !vmalloc_to_page_fn)
-        return;
-
-    page = vmalloc_to_page_fn(g_fake_status_page);
-    if (!page)
-        return;
-
-    a->ret = (uint64_t)page;
-    a->skip_origin = 1;
+    return sel_mmap_handle_status_fn(file, vma);
 }
 
-static bool install_status_page_redirect(void)
+static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
+{
+    if (!should_bypass_clean_filter(current_uid())) {
+        loff_t pos;
+        size_t count = (size_t)a->arg2;
+        if (!a->arg3 || (pos = *(loff_t *)a->arg3) < 0) {
+            a->ret = (uint64_t)(-EINVAL);
+        } else if (!count || pos >= (loff_t)sizeof(g_clean_status_bytes)) {
+            a->ret = 0;
+        } else {
+            size_t available = sizeof(g_clean_status_bytes) - (size_t)pos;
+            if (count > available)
+                count = available;
+            if (compat_copy_to_user((char __user *)a->arg1,
+                                    g_clean_status_bytes + (size_t)pos,
+                                    (int)count) != (int)count) {
+                a->ret = (uint64_t)(-EFAULT);
+            } else {
+                *(loff_t *)a->arg3 = pos + (loff_t)count;
+                a->ret = (uint64_t)count;
+            }
+        }
+        a->skip_origin = 1;
+    }
+}
+
+static void before_sel_mmap_handle_status(hook_fargs4_t *a, void *u)
+{
+    if (!should_bypass_clean_filter(current_uid())) {
+        a->ret = (uint64_t)sel_mmap_handle_status_hook(
+            (struct file *)a->arg0, (struct vm_area_struct *)a->arg1);
+        a->skip_origin = 1;
+    }
+}
+
+static bool install_status_hooks(void)
 {
     unsigned long addr;
     hook_err_t err;
-    void *page;
-    size_t fake_page_size = runtime_page_size();
+    size_t page_size = runtime_page_size();
+    bool installed = false;
 
-    if (READ_ONCE(g_status_page_redirect_hooked))
-        return true;
-
-    if (!vmalloc_fn || !vmalloc_to_page_fn) {
-        pr_warn("[selinux_hook] status page redirect unavailable vmalloc=%px vmalloc_to_page=%px\n",
-                vmalloc_fn, vmalloc_to_page_fn);
-        return false;
-    }
-
-    if (!g_fake_status_page) {
-        g_fake_status_page = vmalloc_fn(fake_page_size);
-        if (!g_fake_status_page) {
-            pr_warn("[selinux_hook] fake status page allocation failed size=%zu\n",
-                    fake_page_size);
-            return false;
+    addr = (unsigned long)lookup_name_optional_suffix("sel_read_handle_status");
+    if (addr) {
+        err = hook_wrap((void *)addr, 4, before_sel_read_handle_status, NULL, NULL);
+        if (err == HOOK_NO_ERR) {
+            record_inline_hook((void *)addr, before_sel_read_handle_status, NULL);
+            pr_info("[selinux_hook] status read hook installed @%px\n", (void *)addr);
+            installed = true;
+        } else {
+            pr_warn("[selinux_hook] status read hook failed err=%d\n", (int)err);
         }
-        zero_bytes(g_fake_status_page, fake_page_size);
-        copy_bytes(g_fake_status_page, g_clean_status_bytes,
-                   sizeof(g_clean_status_bytes));
+    } else {
+        pr_warn("[selinux_hook] cannot find sel_read_handle_status; read status remains native\n");
     }
 
-    page = vmalloc_to_page_fn(g_fake_status_page);
-    if (!page) {
-        pr_warn("[selinux_hook] cannot translate fake status page to struct page\n");
-        return false;
+    addr = (unsigned long)lookup_name_optional_suffix("sel_mmap_handle_status");
+    remap_vmalloc_range_fn = (void *)lookup_name_optional_suffix("remap_vmalloc_range");
+    if (addr && remap_vmalloc_range_fn && vmalloc_user_fn) {
+        if (!g_status_mmap_page) {
+            g_status_mmap_page = vmalloc_user_fn(page_size);
+            if (g_status_mmap_page) {
+                zero_bytes(g_status_mmap_page, page_size);
+                copy_bytes(g_status_mmap_page, g_clean_status_bytes,
+                           sizeof(g_clean_status_bytes));
+            }
+        }
+        if (g_status_mmap_page) {
+            sel_mmap_handle_status_fn = (void *)addr;
+            err = hook_wrap((void *)addr, 2, before_sel_mmap_handle_status, NULL, NULL);
+            if (err == HOOK_NO_ERR) {
+                record_inline_hook((void *)addr, before_sel_mmap_handle_status, NULL);
+                pr_info("[selinux_hook] status mmap hook installed @%px fake_page=%px size=%zu\n",
+                        (void *)addr, g_status_mmap_page, page_size);
+                installed = true;
+            } else {
+                pr_warn("[selinux_hook] status mmap hook failed err=%d\n", (int)err);
+            }
+        } else {
+            pr_warn("[selinux_hook] status mmap fake page allocation failed size=%zu\n", page_size);
+        }
+    } else {
+        pr_warn("[selinux_hook] status mmap unavailable handler=%px remap=%px vmalloc_user=%px\n",
+                (void *)addr, remap_vmalloc_range_fn, vmalloc_user_fn);
     }
 
-    addr = (unsigned long)lookup_name_optional_suffix("selinux_kernel_status_page");
-    if (!addr) {
-        pr_warn("[selinux_hook] cannot find selinux_kernel_status_page\n");
-        return false;
-    }
-
-    /* Both void(void) and stateful page-factory ABIs are safe through the
-     * four-register transit: a state argument remains in x0 when present,
-     * while a void function ignores it. */
-    err = hook_wrap((void *)addr, 1, before_selinux_kernel_status_page,
-                    NULL, NULL);
-    if (err != HOOK_NO_ERR) {
-        pr_warn("[selinux_hook] hook selinux_kernel_status_page failed err=%d\n",
-                (int)err);
-        return false;
-    }
-
-    record_inline_hook((void *)addr, before_selinux_kernel_status_page, NULL);
-    WRITE_ONCE(g_status_page_redirect_hooked, true);
-    pr_info("[selinux_hook] status page redirect installed factory=%px fake_page=%px backing=%px size=%zu\n",
-            (void *)addr, g_fake_status_page, page, fake_page_size);
-    return true;
+    return installed;
 }
 
 static long init(const char *args, const char *event, void *__user r)
@@ -1636,7 +1660,7 @@ static long init(const char *args, const char *event, void *__user r)
     vmalloc_fn = (void *)lookup_name_optional_suffix("vmalloc");
     if (!vmalloc_fn)
         vmalloc_fn = (void *)lookup_name_optional_suffix("vmalloc_noprof");
-    vmalloc_to_page_fn = (void *)lookup_name_optional_suffix("vmalloc_to_page");
+    vmalloc_user_fn = (void *)lookup_name_optional_suffix("vmalloc_user");
     vfree_fn = (void *)lookup_name_optional_suffix("vfree");
     filp_open_fn = (void *)lookup_name_optional_suffix("filp_open");
     filp_close_fn = (void *)lookup_name_optional_suffix("filp_close");
@@ -1668,11 +1692,10 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find security_context_to_sid, procattr clean-policy redirect unavailable\n");
     if (!policydb_read_fn || !policydb_destroy_fn)
         pr_warn("[selinux_hook] cannot find policydb_read/policydb_destroy, clean policydb redirect disabled\n");
-    bool status_page_redirect = false;
-    status_page_redirect = install_status_page_redirect();
-    if (status_page_redirect) pr_info("[selinux_hook] status page redirect successfully\n");
-    else pr_warn("[selinux_hook] status page redirect failed\n");
-    /* On failure, leave the kernel's native status mmap path untouched. */
+    if (install_status_hooks())
+        pr_info("[selinux_hook] status handler hooks installed\n");
+    else
+        pr_warn("[selinux_hook] no status handler hooks installed; native status paths remain active\n");
 
     if (!security_load_policy_fn) {
         pr_warn("[selinux_hook] cannot find security_load_policy, deferred clean policy capture disabled\n");
@@ -1773,18 +1796,11 @@ static long exit_(void *__user r)
 {
     uninstall_inline_hooks();
 
-    /*
-     * The fake page is returned through selinux_kernel_status_page() and may
-     * still be referenced by already-open status files or VMAs.  Freeing it
-     * here prevents a persistent vmalloc leak, but deliberately accepts the
-     * resulting stale-reference/UAF risk during module unload.
-     */
-    if (g_fake_status_page) {
-        pr_warn("[selinux_hook] UNSAFE: forcing fake SELinux status page free at exit; stale file/VMA references may cause UAF or a kernel crash\n");
+    if (g_status_mmap_page) {
+        pr_warn("[selinux_hook] UNSAFE: forcing fake SELinux status page free at exit; stale VMA references may cause UAF or a kernel crash\n");
         if (vfree_fn) {
-            vfree_fn(g_fake_status_page);
-            g_fake_status_page = NULL;
-            WRITE_ONCE(g_status_page_redirect_hooked, false);
+            vfree_fn(g_status_mmap_page);
+            g_status_mmap_page = NULL;
         } else {
             pr_err("[selinux_hook] cannot free fake SELinux status page: vfree is unavailable; vmalloc memory remains allocated\n");
         }
