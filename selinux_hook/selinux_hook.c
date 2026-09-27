@@ -73,7 +73,11 @@ static void (*policydb_destroy_fn)(struct policydb *policydb);
 static void *(*vmalloc_fn)(unsigned long size);
 static void *(*vmalloc_user_fn)(unsigned long size);
 static void (*vfree_fn)(const void *addr);
-static int (*sel_mmap_handle_status_fn)(struct file *, struct vm_area_struct *);
+typedef ssize_t (*sel_status_read_fn_t)(struct file *, char __user *, size_t, loff_t *);
+typedef int (*sel_status_mmap_fn_t)(struct file *, struct vm_area_struct *);
+static sel_status_read_fn_t sel_read_status_fp_orig_fn;
+static sel_status_mmap_fn_t sel_mmap_handle_status_fn;
+static sel_status_mmap_fn_t sel_mmap_status_fp_orig_fn;
 static int (*remap_vmalloc_range_fn)(struct vm_area_struct *, void *, unsigned long);
 static struct file *(*filp_open_fn)(const char *filename, int flags, umode_t mode);
 static int (*filp_close_fn)(struct file *filp, fl_owner_t id);
@@ -110,6 +114,9 @@ static struct access_probe g_probes[ACCESS_PROBE_SLOTS];
 static struct clean_eval_scope g_clean_eval_scopes[CLEAN_EVAL_SCOPE_SLOTS];
 static unsigned char g_clean_status_bytes[SELINUX_STATUS_SIZE];
 static void *g_status_mmap_page;
+static uintptr_t g_status_fp_slots[2];
+static void *g_status_fp_orig[2];
+static int g_status_fp_hooks;
 
 /* Spinlock guards for the scope arrays.  We do not use DEFINE_SPINLOCK +
  * spin_lock() because the running kernel on this device does not export
@@ -149,6 +156,8 @@ static bool current_in_clean_eval_scope(void);
 static int install_write_op_hooks(void);
 static void record_inline_hook(void *func, void *before, void *after);
 static void uninstall_inline_hooks(void);
+static void uninstall_status_fp_hooks(void);
+static void uninstall_all_hooks(void);
 static int sel_mmap_handle_status_hook(struct file *file, struct vm_area_struct *vma);
 static bool install_status_hooks(void);
 
@@ -435,6 +444,7 @@ static struct symbol_cache_entry g_symbol_cache[] = {
     SYMBOL_CACHE_ENTRY("vfree"),
     SYMBOL_CACHE_ENTRY("sel_read_handle_status"),
     SYMBOL_CACHE_ENTRY("sel_mmap_handle_status"),
+    SYMBOL_CACHE_ENTRY("sel_handle_status_ops"),
     SYMBOL_CACHE_ENTRY("remap_vmalloc_range"),
     SYMBOL_CACHE_ENTRY("filp_open"),
     SYMBOL_CACHE_ENTRY("filp_close"),
@@ -1493,6 +1503,70 @@ static void uninstall_inline_hooks(void)
     g_hooks = 0;
 }
 
+static bool install_status_fp_hook(uintptr_t slot, void *replace,
+                                   void **backup, const char *name)
+{
+    if (!slot || !replace || !backup)
+        return false;
+
+    if (g_status_fp_hooks >= (int)(sizeof(g_status_fp_slots) /
+                                   sizeof(g_status_fp_slots[0]))) {
+        pr_warn("[selinux_hook] status fp hook table full for %s\n", name);
+        return false;
+    }
+
+    *backup = NULL;
+    fp_hook(slot, replace, backup);
+    if (!*backup) {
+        pr_warn("[selinux_hook] status fp hook failed for %s slot=%px\n",
+                name, (void *)slot);
+        return false;
+    }
+
+    g_status_fp_slots[g_status_fp_hooks] = slot;
+    g_status_fp_orig[g_status_fp_hooks] = *backup;
+    g_status_fp_hooks++;
+    pr_info("[selinux_hook] status fp hook installed for %s slot=%px\n",
+            name, (void *)slot);
+    return true;
+}
+
+static uintptr_t find_status_fops_slot(unsigned long status_ops,
+                                       unsigned long index)
+{
+    unsigned long *ops;
+
+    /* KernelPatch's sel_handle_status_ops layout uses read=3 and mmap=12. */
+    if (!status_ops || !index || is_bad_address((void *)status_ops))
+        return 0;
+
+    ops = (unsigned long *)status_ops;
+    if (is_bad_address((void *)&ops[index]))
+        return 0;
+    return (uintptr_t)&ops[index];
+}
+
+static void uninstall_status_fp_hooks(void)
+{
+    int i;
+
+    for (i = g_status_fp_hooks - 1; i >= 0; i--) {
+        if (g_status_fp_slots[i])
+            fp_unhook(g_status_fp_slots[i], g_status_fp_orig[i]);
+        g_status_fp_slots[i] = 0;
+        g_status_fp_orig[i] = NULL;
+    }
+    g_status_fp_hooks = 0;
+    sel_read_status_fp_orig_fn = NULL;
+    sel_mmap_status_fp_orig_fn = NULL;
+}
+
+static void uninstall_all_hooks(void)
+{
+    uninstall_inline_hooks();
+    uninstall_status_fp_hooks();
+}
+
 /* Hook: selinux_setprocattr(name, value, size) clean-policy wrapper */
 static void before_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
 {
@@ -1525,7 +1599,30 @@ static void after_selinux_setprocattr_clean_eval(hook_fargs3_t *a, void *u)
 }
 
 /* /sys/fs/selinux/status has independent read and mmap handlers. */
-static int sel_mmap_handle_status_hook(struct file *file, struct vm_area_struct *vma)
+static ssize_t read_clean_status_bytes(char __user *buffer, size_t count,
+                                       loff_t *ppos)
+{
+    loff_t pos;
+    size_t available;
+
+    if (!ppos || (pos = *ppos) < 0)
+        return -EINVAL;
+    if (!count || pos >= (loff_t)sizeof(g_clean_status_bytes))
+        return 0;
+
+    available = sizeof(g_clean_status_bytes) - (size_t)pos;
+    if (count > available)
+        count = available;
+    if (compat_copy_to_user(buffer, g_clean_status_bytes + (size_t)pos,
+                            (int)count) != (int)count)
+        return -EFAULT;
+
+    *ppos = pos + (loff_t)count;
+    return (ssize_t)count;
+}
+
+static int sel_mmap_handle_status_hook(struct file *file,
+                                       struct vm_area_struct *vma)
 {
     if (should_bypass_clean_filter(current_uid()) || !g_status_mmap_page ||
         !remap_vmalloc_range_fn)
@@ -1537,28 +1634,46 @@ static int sel_mmap_handle_status_hook(struct file *file, struct vm_area_struct 
     return sel_mmap_handle_status_fn(file, vma);
 }
 
+static ssize_t sel_read_handle_status_fp_hook(struct file *file,
+                                              char __user *buffer,
+                                              size_t count, loff_t *ppos)
+{
+    if (should_bypass_clean_filter(current_uid())) {
+        if (sel_read_status_fp_orig_fn)
+            return sel_read_status_fp_orig_fn(file, buffer, count, ppos);
+        return -ENOSYS;
+    }
+    return read_clean_status_bytes(buffer, count, ppos);
+}
+
+static int sel_mmap_handle_status_fp_hook(struct file *file,
+                                          struct vm_area_struct *vma)
+{
+    if (should_bypass_clean_filter(current_uid())) {
+        if (sel_mmap_status_fp_orig_fn)
+            return sel_mmap_status_fp_orig_fn(file, vma);
+        return -ENOSYS;
+    }
+
+    if (!g_status_mmap_page || !remap_vmalloc_range_fn) {
+        if (sel_mmap_status_fp_orig_fn)
+            return sel_mmap_status_fp_orig_fn(file, vma);
+        return -ENOSYS;
+    }
+
+    if (!remap_vmalloc_range_fn(vma, g_status_mmap_page, 0))
+        return 0;
+
+    if (sel_mmap_status_fp_orig_fn)
+        return sel_mmap_status_fp_orig_fn(file, vma);
+    return -ENOSYS;
+}
+
 static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
 {
     if (!should_bypass_clean_filter(current_uid())) {
-        loff_t pos;
-        size_t count = (size_t)a->arg2;
-        if (!a->arg3 || (pos = *(loff_t *)a->arg3) < 0) {
-            a->ret = (uint64_t)(-EINVAL);
-        } else if (!count || pos >= (loff_t)sizeof(g_clean_status_bytes)) {
-            a->ret = 0;
-        } else {
-            size_t available = sizeof(g_clean_status_bytes) - (size_t)pos;
-            if (count > available)
-                count = available;
-            if (compat_copy_to_user((char __user *)a->arg1,
-                                    g_clean_status_bytes + (size_t)pos,
-                                    (int)count) != (int)count) {
-                a->ret = (uint64_t)(-EFAULT);
-            } else {
-                *(loff_t *)a->arg3 = pos + (loff_t)count;
-                a->ret = (uint64_t)count;
-            }
-        }
+        a->ret = (uint64_t)read_clean_status_bytes(
+            (char __user *)a->arg1, (size_t)a->arg2, (loff_t *)a->arg3);
         a->skip_origin = 1;
     }
 }
@@ -1574,53 +1689,79 @@ static void before_sel_mmap_handle_status(hook_fargs4_t *a, void *u)
 
 static bool install_status_hooks(void)
 {
-    unsigned long addr;
+    unsigned long read_addr;
+    unsigned long mmap_addr;
+    unsigned long status_ops;
+    uintptr_t slot;
     hook_err_t err;
     size_t page_size = runtime_page_size();
     bool installed = false;
 
-    addr = (unsigned long)lookup_name_optional_suffix("sel_read_handle_status");
-    if (addr) {
-        err = hook_wrap((void *)addr, 4, before_sel_read_handle_status, NULL, NULL);
+    read_addr = (unsigned long)lookup_name_optional_suffix("sel_read_handle_status");
+    mmap_addr = (unsigned long)lookup_name_optional_suffix("sel_mmap_handle_status");
+    status_ops = (unsigned long)lookup_name_optional_suffix("sel_handle_status_ops");
+
+    if (read_addr) {
+        err = hook_wrap((void *)read_addr, 4, before_sel_read_handle_status, NULL, NULL);
         if (err == HOOK_NO_ERR) {
-            record_inline_hook((void *)addr, before_sel_read_handle_status, NULL);
-            pr_info("[selinux_hook] status read hook installed @%px\n", (void *)addr);
+            record_inline_hook((void *)read_addr, before_sel_read_handle_status, NULL);
+            pr_info("[selinux_hook] status read inline hook installed @%px\n",
+                    (void *)read_addr);
             installed = true;
         } else {
             pr_warn("[selinux_hook] status read hook failed err=%d\n", (int)err);
         }
     } else {
-        pr_warn("[selinux_hook] cannot find sel_read_handle_status; read status remains native\n");
+        slot = find_status_fops_slot(status_ops, 3);
+        if (install_status_fp_hook(slot, (void *)sel_read_handle_status_fp_hook,
+                                   (void **)&sel_read_status_fp_orig_fn,
+                                   "sel_read_handle_status")) {
+            installed = true;
+        } else {
+            pr_warn("[selinux_hook] status read unavailable direct=%px status_ops=%px slot=%px\n",
+                    (void *)read_addr, (void *)status_ops, (void *)slot);
+        }
     }
 
-    addr = (unsigned long)lookup_name_optional_suffix("sel_mmap_handle_status");
     remap_vmalloc_range_fn = (void *)lookup_name_optional_suffix("remap_vmalloc_range");
-    if (addr && remap_vmalloc_range_fn && vmalloc_user_fn) {
-        if (!g_status_mmap_page) {
-            g_status_mmap_page = vmalloc_user_fn(page_size);
-            if (g_status_mmap_page) {
-                zero_bytes(g_status_mmap_page, page_size);
-                copy_bytes(g_status_mmap_page, g_clean_status_bytes,
-                           sizeof(g_clean_status_bytes));
-            }
-        }
+    if (remap_vmalloc_range_fn && vmalloc_user_fn && !g_status_mmap_page) {
+        g_status_mmap_page = vmalloc_user_fn(page_size);
         if (g_status_mmap_page) {
-            sel_mmap_handle_status_fn = (void *)addr;
-            err = hook_wrap((void *)addr, 2, before_sel_mmap_handle_status, NULL, NULL);
-            if (err == HOOK_NO_ERR) {
-                record_inline_hook((void *)addr, before_sel_mmap_handle_status, NULL);
-                pr_info("[selinux_hook] status mmap hook installed @%px fake_page=%px size=%zu\n",
-                        (void *)addr, g_status_mmap_page, page_size);
-                installed = true;
-            } else {
-                pr_warn("[selinux_hook] status mmap hook failed err=%d\n", (int)err);
-            }
-        } else {
-            pr_warn("[selinux_hook] status mmap fake page allocation failed size=%zu\n", page_size);
+            zero_bytes(g_status_mmap_page, page_size);
+            copy_bytes(g_status_mmap_page, g_clean_status_bytes,
+                       sizeof(g_clean_status_bytes));
         }
+    }
+
+    if (mmap_addr && g_status_mmap_page && remap_vmalloc_range_fn) {
+        sel_mmap_handle_status_fn = (sel_status_mmap_fn_t)mmap_addr;
+        err = hook_wrap((void *)mmap_addr, 2, before_sel_mmap_handle_status, NULL, NULL);
+        if (err == HOOK_NO_ERR) {
+            record_inline_hook((void *)mmap_addr, before_sel_mmap_handle_status, NULL);
+            pr_info("[selinux_hook] status mmap inline hook installed @%px fake_page=%px size=%zu\n",
+                    (void *)mmap_addr, g_status_mmap_page, page_size);
+            installed = true;
+        } else {
+            pr_warn("[selinux_hook] status mmap hook failed err=%d\n", (int)err);
+        }
+    } else if (!mmap_addr && g_status_mmap_page && remap_vmalloc_range_fn) {
+        slot = find_status_fops_slot(status_ops, 12);
+        if (install_status_fp_hook(slot, (void *)sel_mmap_handle_status_fp_hook,
+                                   (void **)&sel_mmap_status_fp_orig_fn,
+                                   "sel_mmap_handle_status")) {
+            installed = true;
+        } else {
+            pr_warn("[selinux_hook] status mmap unavailable direct=%px status_ops=%px slot=%px\n",
+                    (void *)mmap_addr, (void *)status_ops, (void *)slot);
+        }
+    } else if (!mmap_addr) {
+        pr_warn("[selinux_hook] status mmap fallback unavailable direct=%px status_ops=%px remap=%px vmalloc_user=%px fake_page=%px\n",
+                (void *)mmap_addr, (void *)status_ops,
+                remap_vmalloc_range_fn, vmalloc_user_fn, g_status_mmap_page);
     } else {
-        pr_warn("[selinux_hook] status mmap unavailable handler=%px remap=%px vmalloc_user=%px\n",
-                (void *)addr, remap_vmalloc_range_fn, vmalloc_user_fn);
+        pr_warn("[selinux_hook] status mmap unavailable handler=%px remap=%px vmalloc_user=%px fake_page=%px\n",
+                (void *)mmap_addr, remap_vmalloc_range_fn,
+                vmalloc_user_fn, g_status_mmap_page);
     }
 
     return installed;
@@ -1732,7 +1873,7 @@ static long init(const char *args, const char *event, void *__user r)
         if (rc == -EOPNOTSUPP) {
             pr_warn("[selinux_hook] direct selinuxfs write hooks unavailable; continuing without access/context redirect\n");
         } else if (rc) {
-            uninstall_inline_hooks();
+            uninstall_all_hooks();
             return rc;
         }
     } else {
@@ -1794,7 +1935,7 @@ static long init(const char *args, const char *event, void *__user r)
 
 static long exit_(void *__user r)
 {
-    uninstall_inline_hooks();
+    uninstall_all_hooks();
 
     if (g_status_mmap_page) {
         pr_warn("[selinux_hook] UNSAFE: forcing fake SELinux status page free at exit; stale VMA references may cause UAF or a kernel crash\n");
