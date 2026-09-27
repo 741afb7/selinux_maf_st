@@ -1537,6 +1537,7 @@ static uintptr_t find_status_fops_slot(unsigned long status_ops,
     unsigned long *ops;
 
     /* KernelPatch's sel_handle_status_ops layout uses read=3 and mmap=12. */
+	/* but based on actual testing, it should be read=2. */
     if (!status_ops || !index || is_bad_address((void *)status_ops))
         return 0;
 
@@ -1701,6 +1702,10 @@ static bool install_status_hooks(void)
     mmap_addr = (unsigned long)lookup_name_optional_suffix("sel_mmap_handle_status");
     status_ops = (unsigned long)lookup_name_optional_suffix("sel_handle_status_ops");
 
+	/* Temporary fallback-only test. */
+    //read_addr = 0;
+    //mmap_addr = 0;
+
     if (read_addr) {
         err = hook_wrap((void *)read_addr, 4, before_sel_read_handle_status, NULL, NULL);
         if (err == HOOK_NO_ERR) {
@@ -1712,7 +1717,7 @@ static bool install_status_hooks(void)
             pr_warn("[selinux_hook] status read hook failed err=%d\n", (int)err);
         }
     } else {
-        slot = find_status_fops_slot(status_ops, 3);
+        slot = find_status_fops_slot(status_ops, 2);
         if (install_status_fp_hook(slot, (void *)sel_read_handle_status_fp_hook,
                                    (void **)&sel_read_status_fp_orig_fn,
                                    "sel_read_handle_status")) {
