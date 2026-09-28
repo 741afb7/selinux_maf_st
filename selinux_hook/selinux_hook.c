@@ -76,7 +76,6 @@ static void (*vfree_fn)(const void *addr);
 typedef ssize_t (*sel_status_read_fn_t)(struct file *, char __user *, size_t, loff_t *);
 typedef int (*sel_status_mmap_fn_t)(struct file *, struct vm_area_struct *);
 static sel_status_read_fn_t sel_read_status_fp_orig_fn;
-static sel_status_mmap_fn_t sel_mmap_handle_status_fn;
 static sel_status_mmap_fn_t sel_mmap_status_fp_orig_fn;
 static int (*remap_vmalloc_range_fn)(struct vm_area_struct *, void *, unsigned long);
 static struct file *(*filp_open_fn)(const char *filename, int flags, umode_t mode);
@@ -158,7 +157,6 @@ static void record_inline_hook(void *func, void *before, void *after);
 static void uninstall_inline_hooks(void);
 static void uninstall_status_fp_hooks(void);
 static void uninstall_all_hooks(void);
-static int sel_mmap_handle_status_hook(struct file *file, struct vm_area_struct *vma);
 static bool install_status_hooks(void);
 
 /*
@@ -1622,17 +1620,12 @@ static ssize_t read_clean_status_bytes(char __user *buffer, size_t count,
     return (ssize_t)count;
 }
 
-static int sel_mmap_handle_status_hook(struct file *file,
-                                       struct vm_area_struct *vma)
+static bool remap_clean_status_page(struct vm_area_struct *vma)
 {
-    if (should_bypass_clean_filter(current_uid()) || !g_status_mmap_page ||
-        !remap_vmalloc_range_fn)
-        return sel_mmap_handle_status_fn(file, vma);
+    if (!g_status_mmap_page || !remap_vmalloc_range_fn)
+        return false;
 
-    if (!remap_vmalloc_range_fn(vma, g_status_mmap_page, 0))
-        return 0;
-
-    return sel_mmap_handle_status_fn(file, vma);
+    return remap_vmalloc_range_fn(vma, g_status_mmap_page, 0) == 0;
 }
 
 static ssize_t sel_read_handle_status_fp_hook(struct file *file,
@@ -1681,9 +1674,9 @@ static void before_sel_read_handle_status(hook_fargs4_t *a, void *u)
 
 static void before_sel_mmap_handle_status(hook_fargs4_t *a, void *u)
 {
-    if (!should_bypass_clean_filter(current_uid())) {
-        a->ret = (uint64_t)sel_mmap_handle_status_hook(
-            (struct file *)a->arg0, (struct vm_area_struct *)a->arg1);
+    if (!should_bypass_clean_filter(current_uid()) &&
+        remap_clean_status_page((struct vm_area_struct *)a->arg1)) {
+        a->ret = 0;
         a->skip_origin = 1;
     }
 }
@@ -1739,7 +1732,6 @@ static bool install_status_hooks(void)
     }
 
     if (mmap_addr && g_status_mmap_page && remap_vmalloc_range_fn) {
-        sel_mmap_handle_status_fn = (sel_status_mmap_fn_t)mmap_addr;
         err = hook_wrap((void *)mmap_addr, 2, before_sel_mmap_handle_status, NULL, NULL);
         if (err == HOOK_NO_ERR) {
             record_inline_hook((void *)mmap_addr, before_sel_mmap_handle_status, NULL);
