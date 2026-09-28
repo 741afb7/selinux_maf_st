@@ -1529,20 +1529,37 @@ static bool install_status_fp_hook(uintptr_t slot, void *replace,
     return true;
 }
 
+#define STATUS_FOPS_SCAN_ENTRIES 32
+
+static unsigned long read_status_fops_slot(uintptr_t slot)
+{
+    if (!slot || is_bad_address((void *)slot))
+        return 0;
+    return READ_ONCE(*(unsigned long *)slot);
+}
+
+/* Resolve the fp_hook target by the handler address, not by a file_operations
+ * field number.  The layout differs between kernel revisions and vendor
+ * trees; fp_hook still receives the address of the matching pointer slot. */
 static uintptr_t find_status_fops_slot(unsigned long status_ops,
-                                       unsigned long index)
+                                       unsigned long handler)
 {
     unsigned long *ops;
+    int i;
 
-    /* KernelPatch's sel_handle_status_ops layout uses read=3 and mmap=12. */
-	/* but based on actual testing, it should be read=2. */
-    if (!status_ops || !index || is_bad_address((void *)status_ops))
+    if (!status_ops || !handler || is_bad_address((void *)status_ops))
         return 0;
 
     ops = (unsigned long *)status_ops;
-    if (is_bad_address((void *)&ops[index]))
-        return 0;
-    return (uintptr_t)&ops[index];
+    for (i = 0; i < STATUS_FOPS_SCAN_ENTRIES; i++) {
+        uintptr_t slot = (uintptr_t)&ops[i];
+
+        if (is_bad_address((void *)slot))
+            break;
+        if (read_status_fops_slot(slot) == handler)
+            return slot;
+    }
+    return 0;
 }
 
 static void uninstall_status_fp_hooks(void)
@@ -1690,14 +1707,12 @@ static bool install_status_hooks(void)
     hook_err_t err;
     size_t page_size = runtime_page_size();
     bool installed = false;
+    bool read_installed = false;
+    bool mmap_installed = false;
 
     read_addr = (unsigned long)lookup_name_optional_suffix("sel_read_handle_status");
     mmap_addr = (unsigned long)lookup_name_optional_suffix("sel_mmap_handle_status");
     status_ops = (unsigned long)lookup_name_optional_suffix("sel_handle_status_ops");
-
-	/* Temporary fallback-only test. */
-    //read_addr = 0;
-    //mmap_addr = 0;
 
     if (read_addr) {
         err = hook_wrap((void *)read_addr, 4, before_sel_read_handle_status, NULL, NULL);
@@ -1706,20 +1721,23 @@ static bool install_status_hooks(void)
             pr_info("[selinux_hook] status read inline hook installed @%px\n",
                     (void *)read_addr);
             installed = true;
-        } else {
-            pr_warn("[selinux_hook] status read hook failed err=%d\n", (int)err);
+            read_installed = true;
         }
-    } else {
-        slot = find_status_fops_slot(status_ops, 2);
+    }
+
+    if (!read_installed && read_addr && status_ops) {
+        slot = find_status_fops_slot(status_ops, read_addr);
         if (install_status_fp_hook(slot, (void *)sel_read_handle_status_fp_hook,
                                    (void **)&sel_read_status_fp_orig_fn,
                                    "sel_read_handle_status")) {
             installed = true;
-        } else {
-            pr_warn("[selinux_hook] status read unavailable direct=%px status_ops=%px slot=%px\n",
-                    (void *)read_addr, (void *)status_ops, (void *)slot);
+            read_installed = true;
         }
     }
+
+    if (!read_installed)
+        pr_warn("[selinux_hook] status read unavailable handler=%px status_ops=%px\n",
+                (void *)read_addr, (void *)status_ops);
 
     remap_vmalloc_range_fn = (void *)lookup_name_optional_suffix("remap_vmalloc_range");
     if (remap_vmalloc_range_fn && vmalloc_user_fn && !g_status_mmap_page) {
@@ -1738,28 +1756,25 @@ static bool install_status_hooks(void)
             pr_info("[selinux_hook] status mmap inline hook installed @%px fake_page=%px size=%zu\n",
                     (void *)mmap_addr, g_status_mmap_page, page_size);
             installed = true;
-        } else {
-            pr_warn("[selinux_hook] status mmap hook failed err=%d\n", (int)err);
+            mmap_installed = true;
         }
-    } else if (!mmap_addr && g_status_mmap_page && remap_vmalloc_range_fn) {
-        slot = find_status_fops_slot(status_ops, 12);
+    }
+
+    if (!mmap_installed && mmap_addr && status_ops && g_status_mmap_page &&
+        remap_vmalloc_range_fn) {
+        slot = find_status_fops_slot(status_ops, mmap_addr);
         if (install_status_fp_hook(slot, (void *)sel_mmap_handle_status_fp_hook,
                                    (void **)&sel_mmap_status_fp_orig_fn,
                                    "sel_mmap_handle_status")) {
             installed = true;
-        } else {
-            pr_warn("[selinux_hook] status mmap unavailable direct=%px status_ops=%px slot=%px\n",
-                    (void *)mmap_addr, (void *)status_ops, (void *)slot);
+            mmap_installed = true;
         }
-    } else if (!mmap_addr) {
-        pr_warn("[selinux_hook] status mmap fallback unavailable direct=%px status_ops=%px remap=%px vmalloc_user=%px fake_page=%px\n",
+    }
+
+    if (!mmap_installed)
+        pr_warn("[selinux_hook] status mmap unavailable handler=%px status_ops=%px remap=%px vmalloc_user=%px fake_page=%px\n",
                 (void *)mmap_addr, (void *)status_ops,
                 remap_vmalloc_range_fn, vmalloc_user_fn, g_status_mmap_page);
-    } else {
-        pr_warn("[selinux_hook] status mmap unavailable handler=%px remap=%px vmalloc_user=%px fake_page=%px\n",
-                (void *)mmap_addr, remap_vmalloc_range_fn,
-                vmalloc_user_fn, g_status_mmap_page);
-    }
 
     return installed;
 }
